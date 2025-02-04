@@ -787,41 +787,42 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
 
         Is called when the new cluster is initialized (through ``initdb`` or a custom bootstrap method).
         """
-        conn_kwargs = {**self._postgresql.connection_pool.conn_kwargs,
-                       'options': '-c synchronous_commit=local -c statement_timeout=0'}
-        if self._config['database'] != self._postgresql.database:
+        for database in Citus.databases(self):
+            conn_kwargs = {**self._postgresql.connection_pool.conn_kwargs,
+                        'options': '-c synchronous_commit=local -c statement_timeout=0'}
+            if database != self._postgresql.database:
+                conn = connect(**conn_kwargs)
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute('CREATE DATABASE {0}'.format(
+                            quote_ident(database, conn)).encode('utf-8'))
+                except ProgrammingError as exc:
+                    if exc.diag.sqlstate == '42P04':  # DuplicateDatabase
+                        logger.debug('Exception when creating database: %r', exc)
+                    else:
+                        raise exc
+                finally:
+                    conn.close()
+
+            conn_kwargs['dbname'] = database
             conn = connect(**conn_kwargs)
             try:
                 with conn.cursor() as cur:
-                    cur.execute('CREATE DATABASE {0}'.format(
-                        quote_ident(self._config['database'], conn)).encode('utf-8'))
-            except ProgrammingError as exc:
-                if exc.diag.sqlstate == '42P04':  # DuplicateDatabase
-                    logger.debug('Exception when creating database: %r', exc)
-                else:
-                    raise exc
+                    cur.execute('CREATE EXTENSION IF NOT EXISTS citus')
+
+                    superuser = self._postgresql.config.superuser
+                    params = {k: superuser[k] for k in ('password', 'sslcert', 'sslkey') if k in superuser}
+                    if params:
+                        cur.execute("INSERT INTO pg_catalog.pg_dist_authinfo VALUES"
+                                    "(0, pg_catalog.current_user(), %s)",
+                                    (self._postgresql.config.format_dsn(params),))
+
+                    if self.is_coordinator():
+                        r = urlparse(self._postgresql.connection_string)
+                        cur.execute("SELECT pg_catalog.citus_set_coordinator_host(%s, %s, 'primary', 'default')",
+                                    (r.hostname, r.port or 5432))
             finally:
                 conn.close()
-
-        conn_kwargs['dbname'] = self._config['database']
-        conn = connect(**conn_kwargs)
-        try:
-            with conn.cursor() as cur:
-                cur.execute('CREATE EXTENSION IF NOT EXISTS citus')
-
-                superuser = self._postgresql.config.superuser
-                params = {k: superuser[k] for k in ('password', 'sslcert', 'sslkey') if k in superuser}
-                if params:
-                    cur.execute("INSERT INTO pg_catalog.pg_dist_authinfo VALUES"
-                                "(0, pg_catalog.current_user(), %s)",
-                                (self._postgresql.config.format_dsn(params),))
-
-                if self.is_coordinator():
-                    r = urlparse(self._postgresql.connection_string)
-                    cur.execute("SELECT pg_catalog.citus_set_coordinator_host(%s, %s, 'primary', 'default')",
-                                (r.hostname, r.port or 5432))
-        finally:
-            conn.close()
 
     def adjust_postgres_gucs(self, parameters: Dict[str, Any]) -> None:
         """Adjust GUCs in the current PostgreSQL configuration.
