@@ -404,15 +404,26 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
         AbstractMPPHandler.__init__(self, postgresql, config)
         self.daemon = True
         if config:
-            self._connection = postgresql.connection_pool.get(
-                'citus', {'dbname': config['database'],
-                          'options': '-c statement_timeout=0 -c idle_in_transaction_session_timeout=0'})
-        self._pg_dist_group: Dict[int, PgDistTask] = {}  # Cache of pg_dist_node: {groupid: PgDistTask()}
-        self._tasks: List[PgDistTask] = []  # Requests to change pg_dist_group, every task is a `PgDistTask`
-        self._in_flight: Optional[PgDistTask] = None  # Reference to the `PgDistTask` being changed in a transaction
-        self._schedule_load_pg_dist_group = True  # Flag that "pg_dist_group" should be queried from the database
-        self._condition = Condition()  # protects _pg_dist_group, _tasks, _in_flight, and _schedule_load_pg_dist_group
-        self.schedule_cache_rebuild()
+            self._connections = {}
+            for database in Citus.databases(self):
+                citus = 'citus_' + str(database)
+                self._connections.setdefault(database, postgresql.connection_pool.get(
+                    citus, {'dbname': database,
+                            'options': '-c statement_timeout=0 -c idle_in_transaction_session_timeout=0'}))               
+        self._cache_per_database: Dict[str, dict] = {}  # We are creating cache for each database
+        for database in Citus.databases(self):
+            self._pg_dist_group: Dict[int, PgDistTask] = {}  # Cache of pg_dist_node: {groupid: PgDistTask()}
+            self._tasks: List[PgDistTask] = []  # Requests to change pg_dist_group
+            self._in_flight: Optional[PgDistTask] = None  # Reference to the `PgDistTask` being processed
+            self._schedule_load_pg_dist_group = True  # Flag to query "pg_dist_group" from the database
+            self._cache_per_database[database] = {
+                "_pg_dist_group": self._pg_dist_group,
+                "_tasks": self._tasks,
+                "_in_flight": self._in_flight,
+                "_schedule_load_pg_dist_group": self._schedule_load_pg_dist_group
+            }
+            self._condition = Condition()  # protects _pg_dist_group, _tasks, _in_flight, and _schedule_load_pg_dist_group
+            self.schedule_cache_rebuild(database)
 
     def schedule_cache_rebuild(self) -> None:
         """Cache rebuild handler.
