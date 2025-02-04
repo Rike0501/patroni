@@ -379,6 +379,16 @@ class Citus(AbstractMPP):
     def coordinator_group_id(self) -> int:
         """The group id of the Citus coordinator PostgreSQL cluster."""
         return CITUS_COORDINATOR_GROUP_ID
+    
+    @staticmethod
+    def databases(self) -> list:
+        """Check database value from config file.
+
+        If single database then put it in new list and return it.
+        Else returns list of databases from config file.
+        """
+        database_value = self._config['database']
+        return [database_value] if isinstance(database_value, str) else list(database_value)
 
 
 class CitusHandler(Citus, AbstractMPPHandler, Thread):
