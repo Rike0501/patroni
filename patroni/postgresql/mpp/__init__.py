@@ -27,7 +27,7 @@ class AbstractMPP(abc.ABC):
 
     group_re: Any  # re.Pattern[str]
 
-    def __init__(self, config: Dict[str, Union[str, int]]) -> None:
+    def __init__(self, config: Dict[str, Union[str, int, list]]) -> None:
         """Init method for :class:`AbstractMPP`.
 
         :param config: configuration of MPP section.
