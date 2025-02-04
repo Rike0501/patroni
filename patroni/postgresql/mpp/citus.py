@@ -487,6 +487,8 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
         cache are matching the cluster view from DCS by creating tasks
         the same way as it is done from the REST API."""
 
+        self.add_new_databases()
+
         if not self.is_coordinator():
             return
 
@@ -688,7 +690,7 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
         except Exception as e:
             logger.error('Failed to parse connection url %s: %r', conn_url, e)
 
-    def add_task(self, event: str, groupid: int, cluster: Cluster, leader_name: str, leader_url: str,
+    def add_task(self, database: str, event: str, groupid: int, cluster: Cluster, leader_name: str, leader_url: str,
                  timeout: Optional[float] = None, cooldown: Optional[float] = None) -> Optional[PgDistTask]:
         primary = self._pg_dist_node('demoted' if event == 'before_demote' else 'primary', leader_url)
         if not primary:
@@ -701,7 +703,7 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
                 else None
             if secondary:
                 task.add(secondary)
-        return task if self._add_task(task) else None
+        return task if self._add_task(database, task) else None
 
     def handle_event(self, cluster: Cluster, event: Dict[str, Any]) -> None:
         if not self.is_alive():
@@ -711,11 +713,12 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
         if not (worker and worker.leader and worker.leader.name == event['leader'] and worker.leader.conn_url):
             return logger.info('Discarding event %s', event)
 
-        task = self.add_task(event['type'], event['group'], worker,
-                             worker.leader.name, worker.leader.conn_url,
-                             event['timeout'], event['cooldown'] * 1000)
-        if task and event['type'] == 'before_demote':
-            task.wait()
+        for database in self._cache_per_database.keys():
+            task = self.add_task(database, event['type'], event['group'], worker,
+                                worker.leader.name, worker.leader.conn_url,
+                                event['timeout'], event['cooldown'] * 1000)
+            if task and event['type'] == 'before_demote':
+                task.wait()
 
 
     def add_new_databases(self) -> None:
