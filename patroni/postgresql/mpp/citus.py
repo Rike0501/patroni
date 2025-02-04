@@ -510,7 +510,7 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
             if task.groupid == groupid:
                 return i
 
-    def pick_task(self) -> Tuple[Optional[int], Optional[PgDistTask]]:
+    def pick_task(self, database: str) -> Tuple[Optional[int], Optional[PgDistTask]]:
         """Returns the tuple(i, task), where `i` - is the task index in the self._tasks list
 
         Tasks are picked by following priorities:
@@ -523,21 +523,21 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
         """
 
         with self._condition:
-            if self._in_flight:
-                i = self.find_task_by_groupid(self._in_flight.groupid)
+            if self._cache_per_database[database]["_in_flight"]:
+                i = self.find_task_by_groupid(self._cache_per_database[database]["_in_flight"].groupid, database)
             else:
                 while True:
-                    i = self.find_task_by_groupid(CITUS_COORDINATOR_GROUP_ID)  # set_coordinator
-                    if i is None and self._tasks:
+                    i = self.find_task_by_groupid(CITUS_COORDINATOR_GROUP_ID, database)  # set_coordinator
+                    if i is None and self._cache_per_database[database]["_tasks"]:
                         i = 0
                     if i is None:
                         break
-                    task = self._tasks[i]
-                    if task == self._pg_dist_group.get(task.groupid):
-                        self._tasks.pop(i)  # nothing to do because cached version of pg_dist_group already matches
+                    task = self._cache_per_database[database]["_tasks"][i]
+                    if task == self._cache_per_database[database]["_pg_dist_group"].get(task.groupid):
+                        self._cache_per_database[database]["_tasks"].pop(i)  # nothing to do because cached version of pg_dist_group already matches
                     else:
                         break
-            task = self._tasks[i] if i is not None else None
+            task = self._cache_per_database[database]["_tasks"][i] if i is not None else None
 
             return i, task
 
