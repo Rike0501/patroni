@@ -631,20 +631,28 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
         while True:
             try:
                 with self._condition:
-                    if self._schedule_load_pg_dist_group:
-                        timeout = -1
-                    elif self._in_flight:
-                        timeout = self._in_flight.deadline - time.time() if self._tasks else None
-                    else:
-                        timeout = -1 if self._tasks else None
+                    for database, attributes in self._cache_per_database.items():
+                            _schedule_load_pg_dist_group = attributes["_schedule_load_pg_dist_group"]
+                            _in_flight = attributes["_in_flight"]
+                            _tasks = attributes["_tasks"]
+                            if _schedule_load_pg_dist_group:
+                                timeout = -1
+                            elif _in_flight:
+                                timeout = _in_flight.deadline - time.time() if _tasks else None
+                            else:
+                                timeout = -1 if _tasks else None
 
-                    if timeout is None or timeout > 0:
-                        self._condition.wait(timeout)
-                    elif self._in_flight:
-                        logger.warning('Rolling back transaction. Last known status: %s', self._in_flight)
-                        self.query('ROLLBACK')
-                        self._in_flight = None
-                self.process_tasks()
+                            if timeout is None or timeout > 0:
+                                self._condition.wait(timeout)
+                            elif _in_flight:
+                                logger.warning(
+                                    'Rolling back transaction for database "%s". Last known status: %s',
+                                    database,
+                                    _in_flight
+                                )
+                                self.query(database, 'ROLLBACK')
+                                attributes["_in_flight"] = None
+                            self.process_tasks(database)
             except Exception:
                 logger.exception('run')
 
