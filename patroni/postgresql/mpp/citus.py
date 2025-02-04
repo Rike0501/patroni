@@ -599,32 +599,32 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
             self.update_group(database, task, True)
         return False
 
-    def process_tasks(self) -> None:
+    def process_tasks(self, database: str) -> None:
         while True:
             # Read access to `_in_flight` isn't protected because we know it can't be changed outside of our thread.
-            if not self._in_flight and not self.load_pg_dist_group():
+            if not self._cache_per_database[database]["_in_flight"] and not self.load_pg_dist_group(database):
                 break
 
-            i, task = self.pick_task()
+            i, task = self.pick_task(database)
             if not task or i is None:
                 break
             try:
-                update_cache = self.process_task(task)
+                update_cache = self.process_task(task, database)
             except Exception as e:
                 logger.error('Exception when working with pg_dist_node: %r', e)
                 update_cache = None
             with self._condition:
-                if self._tasks:
+                if self._cache_per_database[database]["_tasks"]:
                     if update_cache:
-                        self._pg_dist_group[task.groupid] = task
+                        self._cache_per_database[database]["_pg_dist_group"][task.groupid] = task
 
                     if update_cache is False:  # an indicator that process_tasks has started a transaction
-                        self._in_flight = task
+                        self._cache_per_database[database]["_in_flight"]
                     else:
-                        self._in_flight = None
+                        self._cache_per_database[database]["_in_flight"] = None
 
-                    if id(self._tasks[i]) == id(task):
-                        self._tasks.pop(i)
+                    if id(self._cache_per_database[database]["_tasks"][i]) == id(task):
+                        self._cache_per_database[database]["_tasks"].pop(i)
             task.wakeup()
 
     def run(self) -> None:
