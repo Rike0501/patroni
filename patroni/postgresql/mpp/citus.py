@@ -463,8 +463,8 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
             self._cache_per_database[database]["_schedule_load_pg_dist_group"] = False
 
         try:
-            rows = self.query( database,'SELECT groupid, nodename, nodeport, \
-                              noderole, nodeid FROM pg_catalog.pg_dist_node' )
+            rows = self.query(database,'SELECT groupid, nodename, nodeport,  \
+                              noderole, nodeid FROM pg_catalog.pg_dist_node')
         except Exception:
             return False
 
@@ -499,7 +499,7 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
 
         for database in self._cache_per_database.keys():
             self.add_task(database, 'after_promote', CITUS_COORDINATOR_GROUP_ID, cluster,
-                         self._postgresql.name, self._postgresql.connection_string)
+                            self._postgresql.name, self._postgresql.connection_string)
 
             for groupid, worker in cluster.workers.items():
                 leader = worker.leader
@@ -673,22 +673,28 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
                 # Only when the timeout is reached new tasks could be scheduled from sync_meta_data()
                 if self._cache_per_database[database]["_in_flight"] and \
                 self._cache_per_database[database]["_in_flight"].groupid == \
-                task.groupid and self._cache_per_database[database]["_in_flight"].timeout is not None\
-                        and self._cache_per_database[database]["_in_flight"].deadline > time.time():
+                    task.groupid and self._cache_per_database[database]["_in_flight"].timeout is not None\
+                            and self._cache_per_database[database]["_in_flight"].deadline > time.time():
                     return False
 
             # Override already existing task for the same worker groupid
             if i is not None:
                 if task != \
-                self._cache_per_database[database]["_tasks"][i]:
-                    logger.debug('Overriding existing task: %s != \
+                    self._cache_per_database[database]["_tasks"][i]:
+                        logger.debug('Overriding existing task: %s != \
                                 %s', self._cache_per_database[database]["_tasks"][i], task)
-                    self._cache_per_database[database]["_tasks"][i] = task
-                    self._condition.notify()
-                    return True
+                        self._cache_per_database[database]["_tasks"][i] = task
+                        self._condition.notify()
+                        return True
             # Add the task to the list if Worker node state is different from the cached `pg_dist_group`
-            elif self._cache_per_database[database]["_schedule_load_pg_dist_group"] or task != self._cache_per_database[database]["_pg_dist_group"].get(task.groupid)\
-                    or self._cache_per_database[database]["_in_flight"] and task.groupid == self._cache_per_database[database]["_in_flight"].groupid:
+            elif (
+                self._cache_per_database[database]["_schedule_load_pg_dist_group"]
+                or task != self._cache_per_database[database]["_pg_dist_group"].get(task.groupid)
+                or (
+                    self._cache_per_database[database]["_in_flight"]
+                    and task.groupid == self._cache_per_database[database]["_in_flight"].groupid
+                )
+            ):
                 logger.debug('Adding the new task: %s', task)
                 self._cache_per_database[database]["_tasks"].append(task)
                 self._condition.notify()
@@ -724,13 +730,26 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
             return
 
         worker = cluster.workers.get(event['group'])
-        if not (worker and worker.leader and worker.leader.name == event['leader'] and worker.leader.conn_url):
+        if not (
+            worker
+            and worker.leader
+            and worker.leader.name == event['leader']
+            and worker.leader.conn_url
+        ):
             return logger.info('Discarding event %s', event)
 
         for database in self._cache_per_database.keys():
-            task = self.add_task(database, event['type'], event['group'], worker,
-                                worker.leader.name, worker.leader.conn_url,
-                                event['timeout'], event['cooldown'] * 1000)
+            task = self.add_task(
+                database,
+                event['type'],
+                event['group'],
+                worker,
+                worker.leader.name,
+                worker.leader.conn_url,
+                event['timeout'],
+                event['cooldown'] * 1000,
+            )
+
             if task and event['type'] == 'before_demote':
                 task.wait()
 
@@ -768,8 +787,7 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
 
                 try:
                     with conn.cursor() as cur:
-                        cur.execute('CREATE DATABASE {0}'.format(
-                            quote_ident(database, conn)).encode('utf-8'))
+                        cur.execute('CREATE DATABASE {0}'.format(quote_ident(database, conn)).encode('utf-8'))
                 except ProgrammingError as exc:
                     if exc.diag.sqlstate == '42P04':  # DuplicateDatabase
                         logger.debug('Exception when creating database: %r', exc)
