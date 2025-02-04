@@ -442,16 +442,16 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
                 attributes["_tasks"].clear()
                 attributes["_in_flight"] = None
 
-    def query(self, sql: str, *params: Any) -> List[Tuple[Any, ...]]:
+    def query(self, database: str, sql: str, *params: Any) -> List[Tuple[Any, ...]]:
         try:
             logger.debug('query(%s, %s)', sql, params)
-            return self._connection.query(sql, *params)
+            return self._connections[database].query(sql, *params)
         except Exception as e:
             logger.error('Exception when executing query "%s", (%s): %r', sql, params, e)
-            self._connection.close()
+            self._connections[database].close()
             with self._condition:
-                self._in_flight = None
-            self.schedule_cache_rebuild()
+                self._cache_per_database[database]["_in_flight"] = None
+            self.schedule_cache_rebuild(database)
             raise e
 
     def load_pg_dist_group(self) -> bool:
