@@ -454,16 +454,16 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
             self.schedule_cache_rebuild(database)
             raise e
 
-    def load_pg_dist_group(self) -> bool:
+    def load_pg_dist_group(self, database: str) -> bool:
         """Read from the `pg_dist_node` table and put it into the local cache"""
 
         with self._condition:
-            if not self._schedule_load_pg_dist_group:
+            if not self._cache_per_database[database]["_schedule_load_pg_dist_group"]:
                 return True
-            self._schedule_load_pg_dist_group = False
+            self._cache_per_database[database]["_schedule_load_pg_dist_group"] = False
 
         try:
-            rows = self.query('SELECT groupid, nodename, nodeport, noderole, nodeid FROM pg_catalog.pg_dist_node')
+            rows = self.query(database,'SELECT groupid, nodename, nodeport, noderole, nodeid FROM pg_catalog.pg_dist_node')
         except Exception:
             return False
 
@@ -475,7 +475,7 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
             pg_dist_group[row[0]].add(PgDistNode(*row[1:]))
 
         with self._condition:
-            self._pg_dist_group = pg_dist_group
+            self._cache_per_database[database]["_pg_dist_group"] = pg_dist_group
         return True
 
     def sync_meta_data(self, cluster: Cluster) -> None:
