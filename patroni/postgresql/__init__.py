@@ -1388,7 +1388,8 @@ class Postgresql(object):
         """
         self.ensure_major_version_is_known()
         self.slots_handler.schedule()
-        self.mpp_handler.schedule_cache_rebuild()
+        for database in self._databases:
+            self.mpp_handler.schedule_cache_rebuild(database)
         self._sysid = ''
 
     def _get_gucs(self) -> CaseInsensitiveSet:
