@@ -229,7 +229,7 @@ class Null(AbstractMPP):
 class NullHandler(Null, AbstractMPPHandler):
     """Dummy implementation of :class:`AbstractMPPHandler`."""
 
-    def __init__(self, postgresql: 'Postgresql', config: Dict[str, Union[str, int]]) -> None:
+    def __init__(self, postgresql: 'Postgresql', config: Dict[str, Union[str, int, list]]) -> None:
         """Init method for :class:`NullHandler`.
 
         :param postgresql: a reference to :class:`Postgresql` object.
