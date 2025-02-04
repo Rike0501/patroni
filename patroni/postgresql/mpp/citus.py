@@ -505,8 +505,8 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
                     and leader.data.get('role') in ('master', 'primary') and leader.data.get('state') == 'running':
                 self.add_task('after_promote', groupid, worker, leader.name, leader.conn_url)
 
-    def find_task_by_groupid(self, groupid: int) -> Optional[int]:
-        for i, task in enumerate(self._tasks):
+    def find_task_by_groupid(self, groupid: int, database: str) -> Optional[int]:
+        for i, task in enumerate(self._cache_per_database[database]["_tasks"]):
             if task.groupid == groupid:
                 return i
 
