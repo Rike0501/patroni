@@ -717,6 +717,59 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
         if task and event['type'] == 'before_demote':
             task.wait()
 
+
+    def add_new_databases(self) -> None:
+        """Creates a newly added database(s) and citus extension if not exists."""
+        
+        for database in Citus.databases(self):
+
+            conn_kwargs = {**self._postgresql.connection_pool.conn_kwargs,
+                        'options': '-c synchronous_commit=local -c statement_timeout=0'}
+            
+            if database != self._postgresql.database:
+                conn = connect(**conn_kwargs)
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SHOW transaction_read_only;")
+                        is_read_only = cur.fetchone()[0] == 'on'
+                    
+                    if is_read_only:
+                        logger.info(f"PG instance is secondary and in read-only mode. ")
+                        conn.close()
+                        break
+                except ProgrammingError as exc:
+                    raise exc
+
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT 1 FROM pg_database where datname = %s", (database,))
+                        if cur.fetchone():
+                            logger.info(f"Database already exists. Continue to next database in config...")
+                            conn.close()
+                            continue
+                except ProgrammingError as exc:
+                    raise exc
+
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute('CREATE DATABASE {0}'.format(
+                            quote_ident(database, conn)).encode('utf-8'))
+                except ProgrammingError as exc:
+                    if exc.diag.sqlstate == '42P04':  # DuplicateDatabase
+                        logger.debug('Exception when creating database: %r', exc)
+                    else:
+                        raise exc
+                finally:
+                    conn.close()
+
+            conn_kwargs['dbname'] = database
+            conn = connect(**conn_kwargs)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute('CREATE EXTENSION IF NOT EXISTS citus')
+            finally:
+                conn.close()
+
     def bootstrap(self) -> None:
         """Bootstrap handler.
 
