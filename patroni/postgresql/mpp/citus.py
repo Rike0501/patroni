@@ -394,7 +394,7 @@ class Citus(AbstractMPP):
 class CitusHandler(Citus, AbstractMPPHandler, Thread):
     """Define the interfaces for handling an underlying Citus cluster."""
 
-    def __init__(self, postgresql: 'Postgresql', config: Dict[str, Union[str, int]]) -> None:
+    def __init__(self, postgresql: 'Postgresql', config: Dict[str, Union[str, int, list]]) -> None:
         """"Initialize a new instance of :class:`CitusHandler`.
 
         :param postgresql: the Postgres node.
