@@ -1231,7 +1231,8 @@ class Postgresql(object):
             before_promote()
 
         self.slots_handler.on_promote()
-        self.mpp_handler.schedule_cache_rebuild()
+        for database in self._databases:
+            self.mpp_handler.schedule_cache_rebuild(database)
 
         ret = self.pg_ctl('promote', '-W')
         if ret:
