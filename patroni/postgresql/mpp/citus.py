@@ -553,19 +553,19 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
             node.nodeid = self.query(database, "SELECT pg_catalog.citus_add_node(%s, %s, %s, %s, 'default')",
                                      node.host, node.port, groupid, node.role)[0][0]
 
-    def update_group(self, task: PgDistTask, transaction: bool) -> None:
-        current_state = self._in_flight\
-            or self._pg_dist_group.get(task.groupid)\
+    def update_group(self, database: str, task: PgDistTask, transaction: bool) -> None:
+        current_state = self._cache_per_database[database]["_in_flight"]\
+            or self._cache_per_database[database]["_pg_dist_group"].get(task.groupid)\
             or PgDistTask(task.groupid, set(), 'after_promote')
         transitions = list(task.transition(current_state))
         if transitions:
             if not transaction and len(transitions) > 1:
-                self.query('BEGIN')
+                self.query(database, 'BEGIN')
             for node in transitions:
-                self.update_node(task.groupid, node, task.cooldown)
+                self.update_node(database, task.groupid, node, task.cooldown)
             if not transaction and len(transitions) > 1:
                 task.failover = False
-                self.query('COMMIT')
+                self.query(database, 'COMMIT')
 
     def process_task(self, task: PgDistTask) -> bool:
         """Updates a single row in `pg_dist_group` table, optionally in a transaction.
