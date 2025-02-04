@@ -858,7 +858,7 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
 
         :returns: ``True`` if the replication slots should not be removed, otherwise ``False``.
         """
-        if self._postgresql.is_primary() and slot['type'] == 'logical' and slot['database'] == self._config['database']:
+        if self._postgresql.is_primary() and slot['type'] == 'logical' and slot['database'] in Citus.databases():
             m = CITUS_SLOT_NAME_RE.match(slot['name'])
             return bool(m and {'move': 'pgoutput', 'split': 'citus'}.get(m.group(1)) == slot['plugin'])
         return False
