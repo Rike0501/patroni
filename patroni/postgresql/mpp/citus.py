@@ -496,14 +496,15 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
             if not self.is_alive():
                 self.start()
 
-        self.add_task('after_promote', CITUS_COORDINATOR_GROUP_ID, cluster,
-                      self._postgresql.name, self._postgresql.connection_string)
-
-        for groupid, worker in cluster.workers.items():
-            leader = worker.leader
-            if leader and leader.conn_url\
-                    and leader.data.get('role') in ('master', 'primary') and leader.data.get('state') == 'running':
-                self.add_task('after_promote', groupid, worker, leader.name, leader.conn_url)
+        for database in self._cache_per_database.keys():
+            self.add_task(database, 'after_promote', CITUS_COORDINATOR_GROUP_ID, cluster,
+                        self._postgresql.name, self._postgresql.connection_string)
+           
+            for groupid, worker in cluster.workers.items():
+                leader = worker.leader
+                if leader and leader.conn_url\
+                        and leader.data.get('role') in ('master', 'primary') and leader.data.get('state') == 'running':
+                    self.add_task(database, 'after_promote', groupid, worker, leader.name, leader.conn_url)
 
     def find_task_by_groupid(self, groupid: int, database: str) -> Optional[int]:
         for i, task in enumerate(self._cache_per_database[database]["_tasks"]):
