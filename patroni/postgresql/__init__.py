@@ -88,8 +88,8 @@ class Postgresql(object):
 
         if isinstance(self.config.get('citus')['database'], str):
             self._databases = [self.config.get('citus')['database']]
-        else: 
-            self._databases: list = self.config.get('citus')['database']         
+        else:
+            self._databases: list = self.config.get('citus')['database']
 
         self.bootstrap = Bootstrap(self)
         self.bootstrapping = False
