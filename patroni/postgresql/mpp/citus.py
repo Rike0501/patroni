@@ -567,7 +567,7 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
                 task.failover = False
                 self.query(database, 'COMMIT')
 
-    def process_task(self, task: PgDistTask) -> bool:
+    def process_task(self, task: PgDistTask, database: str) -> bool:
         """Updates a single row in `pg_dist_group` table, optionally in a transaction.
 
         The transaction is started if we do a demote of the worker node or before promoting the other worker if
@@ -586,17 +586,17 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
         """
 
         if task.event == 'after_promote':
-            self.update_group(task, self._in_flight is not None)
-            if self._in_flight:
-                self.query('COMMIT')
+            self.update_group(database, task, self._cache_per_database[database]["_in_flight"] is not None)
+            if self._cache_per_database[database]["_in_flight"]:
+                self.query(database, 'COMMIT')
             task.failover = False
             return True
         else:  # before_demote, before_promote
             if task.timeout:
                 task.deadline = time.time() + task.timeout
-            if not self._in_flight:
-                self.query('BEGIN')
-            self.update_group(task, True)
+            if not self._cache_per_database[database]["_in_flight"]:
+                self.query(database, 'BEGIN')
+            self.update_group(database, task, True)
         return False
 
     def process_tasks(self) -> None:
