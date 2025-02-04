@@ -434,11 +434,13 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
             self._cache_per_database[database]["_schedule_load_pg_dist_group"]=True
 
     def on_demote(self) -> None:
-        with self._condition:
-            self._pg_dist_group.clear()
-            empty_tasks: List[PgDistTask] = []
-            self._tasks[:] = empty_tasks
-            self._in_flight = None
+        """Handle demotion by clearing database-specific attributes."""
+        
+        for database, attributes in self._cache_per_database.items():
+            with self._condition:
+                attributes["_pg_dist_group"].clear()
+                attributes["_tasks"].clear()
+                attributes["_in_flight"] = None
 
     def query(self, sql: str, *params: Any) -> List[Tuple[Any, ...]]:
         try:
