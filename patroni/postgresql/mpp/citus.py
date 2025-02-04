@@ -367,7 +367,7 @@ class Citus(AbstractMPP):
         :returns: ``True`` is config passes validation, otherwise ``False``.
         """
         return isinstance(config, dict) \
-            and isinstance(cast(Dict[str, Any], config).get('database'), str) \
+            and isinstance(cast(Dict[str, Any], config).get('database'), (str, list)) \
             and parse_int(cast(Dict[str, Any], config).get('group')) is not None
 
     @property
