@@ -425,13 +425,13 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
             self._condition = Condition()  # protects _pg_dist_group, _tasks, _in_flight, and _schedule_load_pg_dist_group
             self.schedule_cache_rebuild(database)
 
-    def schedule_cache_rebuild(self) -> None:
+    def schedule_cache_rebuild(self, database: str) -> None:
         """Cache rebuild handler.
 
         Is called to notify handler that it has to refresh its metadata cache from the database.
         """
         with self._condition:
-            self._schedule_load_pg_dist_group = True
+            self._cache_per_database[database]["_schedule_load_pg_dist_group"]=True
 
     def on_demote(self) -> None:
         with self._condition:
