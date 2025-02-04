@@ -1138,7 +1138,7 @@ schema = Schema({
         },
     }),
     Optional("citus"): {
-        "database": str,
+        "database": Union[str, list],
         "group": IntValidator(min=0, expected_type=int, raise_assert=True),
     },
     "postgresql": {
