@@ -542,15 +542,15 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
 
             return i, task
 
-    def update_node(self, groupid: int, node: PgDistNode, cooldown: float = 10000) -> None:
+    def update_node(self, database: str, groupid: int, node: PgDistNode, cooldown: float = 10000) -> None:
         if node.role not in ('primary', 'secondary', 'demoted'):
-            self.query('SELECT pg_catalog.citus_remove_node(%s, %s)', node.host, node.port)
+            self.query(database, 'SELECT pg_catalog.citus_remove_node(%s, %s)', node.host, node.port)
         elif node.nodeid is not None:
             host = node.host + ('-demoted' if node.role == 'demoted' else '')
-            self.query('SELECT pg_catalog.citus_update_node(%s, %s, %s, true, %s)',
+            self.query(database, 'SELECT pg_catalog.citus_update_node(%s, %s, %s, true, %s)',
                        node.nodeid, host, node.port, cooldown)
         elif node.role != 'demoted':
-            node.nodeid = self.query("SELECT pg_catalog.citus_add_node(%s, %s, %s, %s, 'default')",
+            node.nodeid = self.query(database, "SELECT pg_catalog.citus_add_node(%s, %s, %s, %s, 'default')",
                                      node.host, node.port, groupid, node.role)[0][0]
 
     def update_group(self, task: PgDistTask, transaction: bool) -> None:
