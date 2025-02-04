@@ -647,36 +647,36 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
             except Exception:
                 logger.exception('run')
 
-    def _add_task(self, task: PgDistTask) -> bool:
+    def _add_task(self, database: str, task: PgDistTask) -> bool:
         with self._condition:
-            i = self.find_task_by_groupid(task.groupid)
+            i = self.find_task_by_groupid(task.groupid, database)
 
             # The `PgDistNode.timeout` == None is an indicator that it was scheduled from the sync_meta_data().
             if task.timeout is None:
                 # We don't want to override the already existing task created from REST API.
-                if i is not None and self._tasks[i].timeout is not None:
+                if i is not None and self._cache_per_database[database]["_tasks"][i].timeout is not None:
                     return False
 
                 # There is a little race condition with tasks created from REST API - the call made "before" the member
                 # key is updated in DCS. Therefore it is possible that :func:`sync_meta_data` will try to create a task
                 # based on the outdated values of "state"/"role". To solve it we introduce an artificial timeout.
                 # Only when the timeout is reached new tasks could be scheduled from sync_meta_data()
-                if self._in_flight and self._in_flight.groupid == task.groupid and self._in_flight.timeout is not None\
-                        and self._in_flight.deadline > time.time():
+                if self._cache_per_database[database]["_in_flight"] and self._cache_per_database[database]["_in_flight"].groupid == task.groupid and self._cache_per_database[database]["_in_flight"].timeout is not None\
+                        and self._cache_per_database[database]["_in_flight"].deadline > time.time():
                     return False
 
             # Override already existing task for the same worker groupid
             if i is not None:
-                if task != self._tasks[i]:
-                    logger.debug('Overriding existing task: %s != %s', self._tasks[i], task)
-                    self._tasks[i] = task
+                if task != self._cache_per_database[database]["_tasks"][i]:
+                    logger.debug('Overriding existing task: %s != %s', self._cache_per_database[database]["_tasks"][i], task)
+                    self._cache_per_database[database]["_tasks"][i] = task
                     self._condition.notify()
                     return True
             # Add the task to the list if Worker node state is different from the cached `pg_dist_group`
-            elif self._schedule_load_pg_dist_group or task != self._pg_dist_group.get(task.groupid)\
-                    or self._in_flight and task.groupid == self._in_flight.groupid:
+            elif self._cache_per_database[database]["_schedule_load_pg_dist_group"] or task != self._cache_per_database[database]["_pg_dist_group"].get(task.groupid)\
+                    or self._cache_per_database[database]["_in_flight"] and task.groupid == self._cache_per_database[database]["_in_flight"].groupid:
                 logger.debug('Adding the new task: %s', task)
-                self._tasks.append(task)
+                self._cache_per_database[database]["_tasks"].append(task)
                 self._condition.notify()
                 return True
         return False
