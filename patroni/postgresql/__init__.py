@@ -86,10 +86,16 @@ class Postgresql(object):
         self.config = ConfigHandler(self, config)
         self.config.check_directories()
 
-        if isinstance(self.config.get('citus')['database'], str):
-            self._databases = [self.config.get('citus')['database']]
+
+        citus_config = config.get('citus', {})
+        database_value = citus_config.get('database')
+
+        if isinstance(database_value, str):
+            self._databases = [database_value]
+        elif isinstance(database_value, list):
+            self._databases = database_value
         else:
-            self._databases: list = self.config.get('citus')['database']
+            self._databases = []
 
         self.bootstrap = Bootstrap(self)
         self.bootstrapping = False
