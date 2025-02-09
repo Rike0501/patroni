@@ -42,8 +42,8 @@ class TestCitus(BaseTestPostgresql):
         self.c.add_task(self.database, 'after_promote', 2, self.cluster, self.cluster.leader_name, 'postgres://host3:5432/postgres')
         self.assertRaises(SleepException, self.c.run)
         mock_logger_warning.assert_called()
-        #self.assertTrue(mock_logger_warning.call_args[0][0].startswith('Rolling back transaction'))
-        #self.assertTrue(repr(mock_logger_warning.call_args[0][1]).startswith('PgDistTask'))
+        self.assertTrue(mock_logger_warning.call_args[0][0].startswith('Rolling back transaction'))
+        self.assertTrue(repr(mock_logger_warning.call_args[0][2]).startswith('PgDistTask'))
 
     @patch.object(CitusHandler, 'is_alive', Mock(return_value=False))
     @patch.object(CitusHandler, 'start', Mock())
