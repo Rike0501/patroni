@@ -120,7 +120,11 @@ class AbstractMPP(abc.ABC):
         :returns: an instantiated class that implements Handler for this object.
         """
         for cls in self._get_handler_cls():
-            return cls(postgresql, self._config)
+            database_value = self._config['database']
+            if isinstance(database_value, list) and cls.__name__ == "CitusMultiHandler":
+                return cls(postgresql, self._config)
+            elif isinstance(database_value, str) and cls.__name__ == "CitusHandler":
+                return cls(postgresql, self._config) 
         raise PatroniException(f'Failed to initialize {self.__class__.__name__}Handler object')
 
 
