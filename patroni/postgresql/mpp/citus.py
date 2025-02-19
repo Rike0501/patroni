@@ -644,7 +644,7 @@ class CitusMultiHandler(Citus, AbstractMPPHandler, Thread):
                             timeout = -1 if _tasks else None
 
                         if timeout is None or timeout > 0:
-                            self._condition.wait(timeout)
+                            self._cache_per_database[database]["_condition"].wait(timeout)
                         elif _in_flight:
                             logger.warning(
                                 'Rolling back transaction for database "%s". Last known status: %s',
