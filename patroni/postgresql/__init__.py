@@ -86,16 +86,14 @@ class Postgresql(object):
         self.config = ConfigHandler(self, config)
         self.config.check_directories()
 
-
-        citus_config = config.get('citus', {})
-        database_value = citus_config.get('database')
-
-        if isinstance(database_value, str):
-            self._databases = [database_value]
-        elif isinstance(database_value, list):
-            self._databases = database_value
-        else:
-            self._databases = []
+        self._databases = None
+        try:
+            citus_config = config.get('citus', {})
+            database_value = citus_config.get('database')
+            if isinstance(database_value, list):
+                self._databases = database_value
+        except:
+            self._databases = None
 
         self.bootstrap = Bootstrap(self)
         self.bootstrapping = False
@@ -1245,8 +1243,11 @@ class Postgresql(object):
             before_promote()
 
         self.slots_handler.on_promote()
-        for database in self._databases:
-            self.mpp_handler.schedule_cache_rebuild(database)
+        if self._databases is not None:
+            for database in self._databases:
+                self.mpp_handler.schedule_cache_rebuild(database)
+        else:
+            self.mpp_handler.schedule_cache_rebuild()
 
         ret = self.pg_ctl('promote', '-W')
         if ret:
@@ -1394,8 +1395,11 @@ class Postgresql(object):
         """
         self.ensure_major_version_is_known()
         self.slots_handler.schedule()
-        for database in self._databases:
-            self.mpp_handler.schedule_cache_rebuild(database)
+        if self._databases is not None:
+            for database in self._databases:
+                self.mpp_handler.schedule_cache_rebuild(database)
+        else:
+            self.mpp_handler.schedule_cache_rebuild()
         self._sysid = ''
 
     def _get_gucs(self) -> CaseInsensitiveSet:
