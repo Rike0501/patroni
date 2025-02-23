@@ -554,7 +554,7 @@ class CitusMultiHandler(Citus, AbstractMPPHandler, Thread):
                     if i is None:
                         break
                     task = db_cache._tasks[i]
-                    if task == db_cach_pg_dist_group.get(task.groupid):
+                    if task == db_cache._pg_dist_group.get(task.groupid):
                         db_cache._tasks.pop(i)
                     else:
                         break
