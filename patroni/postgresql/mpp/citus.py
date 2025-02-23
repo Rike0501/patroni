@@ -380,6 +380,16 @@ class Citus(AbstractMPP):
         """The group id of the Citus coordinator PostgreSQL cluster."""
         return CITUS_COORDINATOR_GROUP_ID
 
+
+class DatabaseCache:
+    def __init__(self):
+        self._pg_dist_group = {}  # Cache of pg_dist_node: {groupid: PgDistTask()}
+        self._tasks: List[PgDistTask] = []  # Requests to change pg_dist_group
+        self._in_flight: Optional[PgDistTask] = None  # Reference to the `PgDistTask` being processed
+        self._schedule_load_pg_dist_group = True  # Flag to query "pg_dist_group" from the database
+        self._condition = Condition()
+
+
 class CitusMultiHandler(Citus, AbstractMPPHandler, Thread):
     """Define the interfaces for handling an underlying Citus cluster."""
 
@@ -400,38 +410,37 @@ class CitusMultiHandler(Citus, AbstractMPPHandler, Thread):
                 self._connections.setdefault(database, postgresql.connection_pool.get(
                     citus, {'dbname': database,
                             'options': '-c statement_timeout=0 -c idle_in_transaction_session_timeout=0'}))
-        self._cache_per_database: Dict[str, dict] = {}  # We are creating cache for each database
-        for database in self.databases:
-            self._pg_dist_group: Dict[int, PgDistTask] = {}  # Cache of pg_dist_node: {groupid: PgDistTask()}
-            self._tasks: List[PgDistTask] = []  # Requests to change pg_dist_group
-            self._in_flight: Optional[PgDistTask] = None  # Reference to the `PgDistTask` being processed
-            self._schedule_load_pg_dist_group = True  # Flag to query "pg_dist_group" from the database
-            self._condition = Condition()
-            self._cache_per_database[database] = {
-                "_pg_dist_group": self._pg_dist_group,
-                "_tasks": self._tasks,
-                "_in_flight": self._in_flight,
-                "_schedule_load_pg_dist_group": self._schedule_load_pg_dist_group,
-                "_condition": self._condition
-            }
-            self.schedule_cache_rebuild(database)
+       
+        self._cache_per_database: Dict[str, DatabaseCache] = {database: DatabaseCache() for database in self.databases}  # We are creating cache for each database
+        self.schedule_cache_rebuild()
 
-    def schedule_cache_rebuild(self, database: str) -> None:
+    def schedule_cache_rebuild(self) -> None:
+        """Cache rebuild handler.
+
+        Is called to notify handler that it has to refresh its metadata cache from the databases.
+        """
+        for database in self.databases:
+            db_cache = self._cache_per_database[database]
+            with db_cache._condition:
+                db_cache._schedule_load_pg_dist_group = True
+
+    def schedule_cache_rebuild_multi(self, database: str) -> None:
         """Cache rebuild handler.
 
         Is called to notify handler that it has to refresh its metadata cache from the database.
         """
-        with self._cache_per_database[database]["_condition"]:
-            self._cache_per_database[database]["_schedule_load_pg_dist_group"] = True
+        db_cache = self._cache_per_database[database]
+        with db_cache._condition:
+            db_cache._schedule_load_pg_dist_group = True
 
     def on_demote(self) -> None:
         """Handle demotion by clearing database-specific attributes."""
 
-        for database, attributes in self._cache_per_database.items():
-            with self._cache_per_database[database]["_condition"]:
-                attributes["_pg_dist_group"].clear()
-                attributes["_tasks"][:] = []
-                attributes["_in_flight"] = None
+        for database, db_cache in self._cache_per_database.items():
+            with db_cache._condition:
+                db_cache._pg_dist_group.clear()
+                db_cache._tasks[:] = []
+                db_cache._in_flight = None
 
     def query(self, database: str, sql: str, *params: Any) -> List[Tuple[Any, ...]]:
         try:
@@ -440,34 +449,40 @@ class CitusMultiHandler(Citus, AbstractMPPHandler, Thread):
         except Exception as e:
             logger.error('Exception when executing query "%s", (%s): %r', sql, params, e)
             self._connections[database].close()
-            with self._cache_per_database[database]["_condition"]:
-                self._cache_per_database[database]["_in_flight"] = None
-            self.schedule_cache_rebuild(database)
+
+            db_cache = self._cache_per_database[database]
+            with db_cache._condition:
+                db_cache._in_flight = None
+            
+            self.schedule_cache_rebuild_multi(database)
             raise e
 
     def load_pg_dist_group(self, database: str) -> bool:
         """Read from the `pg_dist_node` table and put it into the local cache"""
 
-        with self._cache_per_database[database]["_condition"]:
-            if not self._cache_per_database[database]["_schedule_load_pg_dist_group"]:
+        db_cache = self._cache_per_database[database]
+
+        with db_cache._condition:
+            if not db_cache._schedule_load_pg_dist_group:
                 return True
-            self._cache_per_database[database]["_schedule_load_pg_dist_group"] = False
+            db_cache._schedule_load_pg_dist_group = False
 
         try:
             rows = self.query(database, 'SELECT groupid, nodename, nodeport,  \
-                              noderole, nodeid FROM pg_catalog.pg_dist_node')
+                            noderole, nodeid FROM pg_catalog.pg_dist_node')
         except Exception:
             return False
 
-        pg_dist_group: Dict[int, PgDistTask] = {}
+        _pg_dist_group: Dict[int, PgDistTask] = {}
 
         for row in rows:
-            if row[0] not in pg_dist_group:
-                pg_dist_group[row[0]] = PgDistTask(row[0], nodes=set(), event='after_promote')
-            pg_dist_group[row[0]].add(PgDistNode(*row[1:]))
+            if row[0] not in _pg_dist_group:
+                _pg_dist_group[row[0]] = PgDistTask(row[0], nodes=set(), event='after_promote')
+            _pg_dist_group[row[0]].add(PgDistNode(*row[1:]))
 
-        with self._cache_per_database[database]["_condition"]:
-            self._cache_per_database[database]["_pg_dist_group"] = pg_dist_group
+        with db_cache._condition:
+            db_cache._pg_dist_group = _pg_dist_group
+
         return True
 
     def sync_meta_data(self, cluster: Cluster) -> None:
@@ -489,7 +504,8 @@ class CitusMultiHandler(Citus, AbstractMPPHandler, Thread):
 
         for database in self._cache_per_database.keys():
 
-            with self._cache_per_database[database]["_condition"]:
+            db_cache = self._cache_per_database[database]
+            with db_cache._condition:
                 if not self.is_alive():
                     self.start()
 
@@ -509,7 +525,8 @@ class CitusMultiHandler(Citus, AbstractMPPHandler, Thread):
                     self.add_task(database, 'after_promote', groupid, worker, leader.name, leader.conn_url)
 
     def find_task_by_groupid(self, groupid: int, database: str) -> Optional[int]:
-        for i, task in enumerate(self._cache_per_database[database]["_tasks"]):
+        db_cache = self._cache_per_database[database]
+        for i, task in enumerate(db_cache._tasks):
             if task.groupid == groupid:
                 return i
 
@@ -524,23 +541,24 @@ class CitusMultiHandler(Citus, AbstractMPPHandler, Thread):
            with groupid=0 (coordinators are always in groupid 0).
         3. Pick a task that is the oldest (first from the self._tasks)
         """
-
-        with self._cache_per_database[database]["_condition"]:
-            if self._cache_per_database[database]["_in_flight"]:
-                i = self.find_task_by_groupid(self._cache_per_database[database]["_in_flight"].groupid, database)
+        
+        db_cache = self._cache_per_database[database]
+        with db_cache._condition:
+            if db_cache._in_flight:
+                i = self.find_task_by_groupid(db_cache._in_flight.groupid, database)
             else:
                 while True:
                     i = self.find_task_by_groupid(CITUS_COORDINATOR_GROUP_ID, database)  # set_coordinator
-                    if i is None and self._cache_per_database[database]["_tasks"]:
+                    if i is None and db_cache._tasks:
                         i = 0
                     if i is None:
                         break
-                    task = self._cache_per_database[database]["_tasks"][i]
-                    if task == self._cache_per_database[database]["_pg_dist_group"].get(task.groupid):
-                        self._cache_per_database[database]["_tasks"].pop(i)
+                    task = db_cache._tasks[i]
+                    if task == db_cach_pg_dist_group.get(task.groupid):
+                        db_cache._tasks.pop(i)
                     else:
                         break
-            task = self._cache_per_database[database]["_tasks"][i] if i is not None else None
+            task = db_cache._tasks[i] if i is not None else None
 
             return i, task
 
@@ -556,8 +574,9 @@ class CitusMultiHandler(Citus, AbstractMPPHandler, Thread):
                                      node.host, node.port, groupid, node.role)[0][0]
 
     def update_group(self, database: str, task: PgDistTask, transaction: bool) -> None:
-        current_state = self._cache_per_database[database]["_in_flight"]\
-            or self._cache_per_database[database]["_pg_dist_group"].get(task.groupid)\
+        db_cache = self._cache_per_database[database]
+        current_state = db_cache._in_flight\
+            or db_cache._pg_dist_group.get(task.groupid)\
             or PgDistTask(task.groupid, set(), 'after_promote')
         transitions = list(task.transition(current_state))
         if transitions:
@@ -587,24 +606,26 @@ class CitusMultiHandler(Citus, AbstractMPPHandler, Thread):
             or, if the new transaction was opened, this method returns `False`.
         """
 
+        db_cache = self._cache_per_database[database]
         if task.event == 'after_promote':
-            self.update_group(database, task, self._cache_per_database[database]["_in_flight"] is not None)
-            if self._cache_per_database[database]["_in_flight"]:
+            self.update_group(database, task, db_cache._in_flight is not None)
+            if db_cache._in_flight:
                 self.query(database, 'COMMIT')
             task.failover = False
             return True
         else:  # before_demote, before_promote
             if task.timeout:
                 task.deadline = time.time() + task.timeout
-            if not self._cache_per_database[database]["_in_flight"]:
+            if not db_cache._in_flight:
                 self.query(database, 'BEGIN')
             self.update_group(database, task, True)
         return False
 
     def process_tasks(self, database: str) -> None:
+        db_cache = self._cache_per_database[database]
         while True:
             # Read access to `_in_flight` isn't protected because we know it can't be changed outside of our thread.
-            if not self._cache_per_database[database]["_in_flight"] and not self.load_pg_dist_group(database):
+            if not db_cache._in_flight and not self.load_pg_dist_group(database):
                 break
 
             i, task = self.pick_task(database)
@@ -615,50 +636,49 @@ class CitusMultiHandler(Citus, AbstractMPPHandler, Thread):
             except Exception as e:
                 logger.error('Exception when working with pg_dist_node: %r', e)
                 update_cache = None
-            with self._cache_per_database[database]["_condition"]:
-                if self._cache_per_database[database]["_tasks"]:
+            with db_cache._condition:
+                if db_cache._tasks:
                     if update_cache:
-                        self._cache_per_database[database]["_pg_dist_group"][task.groupid] = task
+                        db_cache._pg_dist_group[task.groupid] = task
 
                     if update_cache is False:  # an indicator that process_tasks has started a transaction
-                        self._cache_per_database[database]["_in_flight"] = task
+                        db_cache._in_flight = task
                     else:
-                        self._cache_per_database[database]["_in_flight"] = None
-                    if id(self._cache_per_database[database]["_tasks"][i]) == id(task):
-                        self._cache_per_database[database]["_tasks"].pop(i)
+                        db_cache._in_flight = None
+                    if id(db_cache._tasks[i]) == id(task):
+                        db_cache._tasks.pop(i)
             task.wakeup()
 
     def run(self) -> None:
         while True:
             try:
-                for database, attributes in self._cache_per_database.items():
-                    with self._cache_per_database[database]["_condition"]:
-                        _schedule_load_pg_dist_group = attributes["_schedule_load_pg_dist_group"]
-                        _in_flight = attributes["_in_flight"]
-                        _tasks = attributes["_tasks"]
-                        if _schedule_load_pg_dist_group:
+                for database in self._cache_per_database.keys():
+                    db_cache = self._cache_per_database[database]
+                    with db_cache._condition:
+                        if db_cache._schedule_load_pg_dist_group:
                             timeout = -1
-                        elif _in_flight:
-                            timeout = _in_flight.deadline - time.time() if _tasks else None
+                        elif db_cache._in_flight:
+                            timeout = db_cache._in_flight.deadline - time.time() if db_cache._tasks else None
                         else:
-                            timeout = -1 if _tasks else None
+                            timeout = -1 if db_cache._tasks else None
 
                         if timeout is None or timeout > 0:
-                            self._cache_per_database[database]["_condition"].wait(timeout)
-                        elif _in_flight:
+                            db_cache._condition.wait(timeout)
+                        elif db_cache._in_flight:
                             logger.warning(
                                 'Rolling back transaction for database "%s". Last known status: %s',
                                 database,
-                                _in_flight
+                                db_cache._in_flight
                             )
                             self.query(database, 'ROLLBACK')
-                            attributes["_in_flight"] = None
+                            db_cache._in_flight = None
                         self.process_tasks(database)
             except Exception:
                 logger.exception('run')
 
     def _add_task(self, database: str, task: PgDistTask) -> bool:
-        with self._cache_per_database[database]["_condition"]:
+        db_cache = self._cache_per_database[database]
+        with db_cache._condition:
             i = self.find_task_by_groupid(task.groupid, database)
 
             # The `PgDistNode.timeout` == None is an indicator that it was scheduled from the sync_meta_data().
@@ -666,7 +686,7 @@ class CitusMultiHandler(Citus, AbstractMPPHandler, Thread):
                 # We don't want to override the already existing task created from REST API.
                 if (
                     i is not None
-                    and self._cache_per_database[database]["_tasks"][i].timeout is not None
+                    and db_cache._tasks[i].timeout is not None
                 ):
                     return False
 
@@ -675,36 +695,36 @@ class CitusMultiHandler(Citus, AbstractMPPHandler, Thread):
                 # based on the outdated values of "state"/"role". To solve it we introduce an artificial timeout.
                 # Only when the timeout is reached new tasks could be scheduled from sync_meta_data()
                 if (
-                    self._cache_per_database[database]["_in_flight"]
-                    and self._cache_per_database[database]["_in_flight"].groupid == task.groupid
-                    and self._cache_per_database[database]["_in_flight"].timeout is not None
-                    and self._cache_per_database[database]["_in_flight"].deadline > time.time()
+                    db_cache._in_flight
+                    and db_cache._in_flight.groupid == task.groupid
+                    and db_cache._in_flight.timeout is not None
+                    and db_cache._in_flight.deadline > time.time()
                 ):
                     return False
 
             # Override already existing task for the same worker groupid
             if i is not None:
-                if task != self._cache_per_database[database]["_tasks"][i]:
+                if task != db_cache._tasks[i]:
                     logger.debug(
                         "Overriding existing task: %s != %s",
-                        self._cache_per_database[database]["_tasks"][i],
+                        db_cache._tasks[i],
                         task,
                     )
-                    self._cache_per_database[database]["_tasks"][i] = task
-                    self._cache_per_database[database]["_condition"].notify()
+                    db_cache._tasks[i] = task
+                    db_cache._condition.notify()
                     return True
             # Add the task to the list if Worker node state is different from the cached `pg_dist_group`
             elif (
-                self._cache_per_database[database]["_schedule_load_pg_dist_group"]
-                or task != self._cache_per_database[database]["_pg_dist_group"].get(task.groupid)
+                db_cache._schedule_load_pg_dist_group
+                or task != db_cache._pg_dist_group.get(task.groupid)
                 or (
-                    self._cache_per_database[database]["_in_flight"]
-                    and task.groupid == self._cache_per_database[database]["_in_flight"].groupid
+                    db_cache._in_flight
+                    and task.groupid == db_cache._in_flight.groupid
                 )
             ):
                 logger.debug('Adding the new task: %s', task)
-                self._cache_per_database[database]["_tasks"].append(task)
-                self._cache_per_database[database]["_condition"].notify()
+                db_cache._tasks.append(task)
+                db_cache._condition.notify()
                 return True
         return False
 
