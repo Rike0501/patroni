@@ -36,8 +36,8 @@ class TestCitus(BaseTestPostgresql):
         # certain timeout. In case if it is not, we want to roll it back
         # in order to not block other workers that want to update
         # `pg_dist_node`.
-        self.c._cache_per_database[self.database]["_condition"].wait = Mock(side_effect=[Mock(), Mock(), Mock(), SleepException])
-        self.c._cache_per_database[self.database2]["_condition"].wait = Mock(side_effect=[Mock(), Mock(), Mock(), SleepException])
+        self.c._cache_per_database[self.database]._condition.wait = Mock(side_effect=[Mock(), Mock(), Mock(), SleepException])
+        self.c._cache_per_database[self.database2]._condition.wait = Mock(side_effect=[Mock(), Mock(), Mock(), SleepException])
 
         self.c.handle_event(self.cluster, {'type': 'before_demote', 'group': 1,
                                            'leader': 'leader', 'timeout': 30, 'cooldown': 10})
@@ -85,23 +85,23 @@ class TestCitus(BaseTestPostgresql):
         self.assertIsNone(self.c.add_task(self.database, 'after_promote', 1, self.cluster,
                                           self.cluster.leader_name, 'postgres://host:5432/postgres'))
         #self.c._in_flight = self.c._tasks.pop()
-        self.c._cache_per_database[self.database]["_in_flight"] = self.c._cache_per_database[self.database]["_tasks"].pop()
+        self.c._cache_per_database[self.database]._in_flight = self.c._cache_per_database[self.database]._tasks.pop()
         #self.c._in_flight.deadline = self.c._in_flight.timeout + time.time()
-        self.c._cache_per_database[self.database]["_in_flight"].deadline =  self.c._cache_per_database[self.database]["_in_flight"].timeout + time.time()
+        self.c._cache_per_database[self.database]._in_flight.deadline =  self.c._cache_per_database[self.database]._in_flight.timeout + time.time()
         self.assertIsNone(self.c.add_task(self.database, 'after_promote', 1, self.cluster,
                                           self.cluster.leader_name, 'postgres://host:5432/postgres'))
         #self.c._in_flight.deadline = 0
-        self.c._cache_per_database[self.database]["_in_flight"].deadline = 0
+        self.c._cache_per_database[self.database]._in_flight.deadline = 0
         self.assertIsNotNone(self.c.add_task(self.database, 'after_promote', 1, self.cluster,
                                              self.cluster.leader_name, 'postgres://host:5432/postgres'))
 
         # If there is no transaction in progress and cached pg_dist_node matching desired state task should not be added
         #self.c._schedule_load_pg_dist_node = False
-        self.c._cache_per_database[self.database]["_schedule_load_pg_dist_node"] = False
+        self.c._cache_per_database[self.database]._schedule_load_pg_dist_node = False
         #self.c._pg_dist_group[self.c._in_flight.groupid] = self.c._in_flight
-        self.c._cache_per_database[self.database]["_pg_dist_group"][self.c._cache_per_database[self.database]["_in_flight"].groupid] = self.c._cache_per_database[self.database]["_in_flight"]
+        self.c._cache_per_database[self.database]._pg_dist_group[self.c._cache_per_database[self.database]._in_flight.groupid] = self.c._cache_per_database[self.database]._in_flight
         #self.c._in_flight = None
-        self.c._cache_per_database[self.database]["_in_flight"] = None
+        self.c._cache_per_database[self.database]._in_flight = None
         self.assertIsNone(self.c.add_task(self.database, 'after_promote', 1, self.cluster,
                                           self.cluster.leader_name, 'postgres://host:5432/postgres'))
 
@@ -146,7 +146,7 @@ class TestCitus(BaseTestPostgresql):
     def test_load_pg_dist_group(self, mock_logger):
         # load_pg_dist_group) triggers, query fails and exception is property handled
         self.c.process_tasks(self.database)
-        self.assertTrue(self.c._cache_per_database[self.database]["_schedule_load_pg_dist_group"])
+        self.assertTrue(self.c._cache_per_database[self.database]._schedule_load_pg_dist_group)
         mock_logger.assert_called()
         self.assertTrue(mock_logger.call_args[0][0].startswith('Exception when executing query'))
         self.assertTrue(mock_logger.call_args[0][1].startswith('SELECT groupid, nodename, '))
