@@ -26,25 +26,30 @@ There are only a few simple rules you need to follow:
 5. Add the following section to the ``patroni.yaml``:
 
 For single database:
-.. code:: YAML
 
+.. code:: YAML
 
         citus:
           group: X  # 0 for coordinator and 1, 2, 3, etc for workers
           database: citus  # must be the same on all nodes
 
 
+-
 
-For multi database: 
+For multi database:
+
 .. code:: YAML
-
 
         citus:
           group: X  # 0 for coordinator and 1, 2, 3, etc for workers
           database: ['citus1', 'citus2']  # must be the same on all nodes
 
 
+-
+
 After that you just need to start Patroni and it will handle the rest:
+
+
 
 0. Patroni will set ``bootstrap.dcs.synchronous_mode`` to :ref:`quorum <quorum_mode>`
    if it is not explicitly set to any other value.
