@@ -21,7 +21,6 @@ class TestCitus(BaseTestPostgresql):
         self.c = self.p.mpp_handler
         handler = self.c.get_citus_database_handlers()
         self.handler = handler['citus']
-        #print(handler['citus'])
         self.cluster = get_cluster_initialized_with_leader()
         self.cluster.workers[1] = self.cluster
 
@@ -38,7 +37,7 @@ class TestCitus(BaseTestPostgresql):
         # `pg_dist_node`.
         self.handler._condition.wait = Mock(side_effect=[Mock(), Mock(), Mock(), SleepException])
 
-        self.handler.handle_event(self.cluster, {'type': 'before_demote', 'group': 1,
+        self.c.handle_event(self.cluster, {'type': 'before_demote', 'group': 1,
                                            'leader': 'leader', 'timeout': 30, 'cooldown': 10})
         self.handler.add_task('after_promote', 2, self.cluster, self.cluster.leader_name, 'postgres://host3:5432/postgres')
         self.assertRaises(SleepException, self.handler.run)
@@ -50,13 +49,13 @@ class TestCitus(BaseTestPostgresql):
     @patch.object(CitusDatabaseHandler, 'start', Mock())
     def test_sync_meta_data(self):
         with patch.object(CitusDatabaseHandler, 'is_enabled', Mock(return_value=False)):
-            self.handler.sync_meta_data(self.cluster)
-        self.handler.sync_meta_data(self.cluster)
+            self.c.sync_meta_data(self.cluster)
+        self.c.sync_meta_data(self.cluster)
 
     def test_handle_event(self):
-        self.handler.handle_event(self.cluster, {})
+        self.c.handle_event(self.cluster, {})
         with patch.object(CitusDatabaseHandler, 'is_alive', Mock(return_value=True)):
-            self.handler.handle_event(self.cluster, {'type': 'after_promote', 'group': 2,
+            self.c.handle_event(self.cluster, {'type': 'after_promote', 'group': 2,
                                                'leader': 'leader', 'timeout': 30, 'cooldown': 10})
 
     def test_add_task(self):
@@ -131,7 +130,7 @@ class TestCitus(BaseTestPostgresql):
             self.assertTrue(mock_logger.call_args[0][0].startswith('Exception when working with pg_dist_node: '))
 
     def test_on_demote(self):
-        self.handler.on_demote()
+        self.c.on_demote()
 
     @patch('patroni.postgresql.mpp.citus.logger.error')
     @patch.object(MockCursor, 'execute', Mock(side_effect=Exception))
@@ -149,32 +148,32 @@ class TestCitus(BaseTestPostgresql):
         task._event.wait = Mock()
         task.wait()
 
-    # def test_adjust_postgres_gucs(self):
-    #     parameters = {'max_connections': 101,
-    #                   'max_prepared_transactions': 0,
-    #                   'shared_preload_libraries': 'foo , citus, bar '}
-    #     self.handler.adjust_postgres_gucs(parameters)
-    #     self.assertEqual(parameters['max_prepared_transactions'], 202)
-    #     self.assertEqual(parameters['shared_preload_libraries'], 'citus,foo,bar')
-    #     self.assertEqual(parameters['wal_level'], 'logical')
-    #     self.assertEqual(parameters['citus.local_hostname'], '/tmp')
+    def test_adjust_postgres_gucs(self):
+        parameters = {'max_connections': 101,
+                      'max_prepared_transactions': 0,
+                      'shared_preload_libraries': 'foo , citus, bar '}
+        self.c.adjust_postgres_gucs(parameters)
+        self.assertEqual(parameters['max_prepared_transactions'], 202)
+        self.assertEqual(parameters['shared_preload_libraries'], 'citus,foo,bar')
+        self.assertEqual(parameters['wal_level'], 'logical')
+        self.assertEqual(parameters['citus.local_hostname'], '/tmp')
 
     def test_ignore_replication_slot(self):
-        self.assertFalse(self.handler.ignore_replication_slot({'name': 'foo', 'type': 'physical',
+        self.assertFalse(self.c.ignore_replication_slot({'name': 'foo', 'type': 'physical',
                                                          'database': 'bar', 'plugin': 'wal2json'}))
-        self.assertFalse(self.handler.ignore_replication_slot({'name': 'foo', 'type': 'logical',
+        self.assertFalse(self.c.ignore_replication_slot({'name': 'foo', 'type': 'logical',
                                                          'database': 'bar', 'plugin': 'wal2json'}))
-        self.assertFalse(self.handler.ignore_replication_slot({'name': 'foo', 'type': 'logical',
+        self.assertFalse(self.c.ignore_replication_slot({'name': 'foo', 'type': 'logical',
                                                          'database': 'bar', 'plugin': 'pgoutput'}))
-        self.assertFalse(self.handler.ignore_replication_slot({'name': 'foo', 'type': 'logical',
+        self.assertFalse(self.c.ignore_replication_slot({'name': 'foo', 'type': 'logical',
                                                          'database': 'citus', 'plugin': 'pgoutput'}))
-        self.assertTrue(self.handler.ignore_replication_slot({'name': 'citus_shard_move_slot_1_2_3',
+        self.assertTrue(self.c.ignore_replication_slot({'name': 'citus_shard_move_slot_1_2_3',
                                                         'type': 'logical', 'database': 'citus', 'plugin': 'pgoutput'}))
-        self.assertFalse(self.handler.ignore_replication_slot({'name': 'citus_shard_move_slot_1_2_3',
+        self.assertFalse(self.c.ignore_replication_slot({'name': 'citus_shard_move_slot_1_2_3',
                                                          'type': 'logical', 'database': 'citus', 'plugin': 'citus'}))
-        self.assertFalse(self.handler.ignore_replication_slot({'name': 'citus_shard_split_slot_1_2_3',
+        self.assertFalse(self.c.ignore_replication_slot({'name': 'citus_shard_split_slot_1_2_3',
                                                          'type': 'logical', 'database': 'citus', 'plugin': 'pgoutput'}))
-        self.assertTrue(self.handler.ignore_replication_slot({'name': 'citus_shard_split_slot_1_2_3',
+        self.assertTrue(self.c.ignore_replication_slot({'name': 'citus_shard_split_slot_1_2_3',
                                                         'type': 'logical', 'database': 'citus', 'plugin': 'citus'}))
 
     @patch('patroni.postgresql.mpp.citus.logger.debug')
@@ -182,11 +181,11 @@ class TestCitus(BaseTestPostgresql):
     @patch('patroni.postgresql.mpp.citus.quote_ident', Mock())
     def test_bootstrap_duplicate_database(self, mock_logger):
         with patch.object(MockCursor, 'execute', Mock(side_effect=ProgrammingError)):
-            self.assertRaises(ProgrammingError, self.handler.bootstrap)
+            self.assertRaises(ProgrammingError, self.c.bootstrap)
         with patch.object(MockCursor, 'execute', Mock(side_effect=[ProgrammingError, None, None, None])), \
                 patch.object(ProgrammingError, 'diag') as mock_diag:
             type(mock_diag).sqlstate = PropertyMock(return_value='42P04')
-            self.handler.bootstrap()
+            self.c.bootstrap()
         mock_logger.assert_called_once()
         self.assertTrue(mock_logger.call_args[0][0].startswith('Exception when creating database'))
 
