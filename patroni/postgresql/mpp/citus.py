@@ -3,7 +3,6 @@ import re
 import time
 
 from threading import Condition, Event, Thread
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, cast, Collection, Dict, Iterator, List, Optional, Set, Tuple, TYPE_CHECKING, Union
 from urllib.parse import urlparse
 
@@ -383,20 +382,11 @@ class Citus(AbstractMPP):
         return CITUS_COORDINATOR_GROUP_ID
 
 
-class DatabaseCache:
-    def __init__(self):
-        self._pg_dist_group = {}  # Cache of pg_dist_node: {groupid: PgDistTask()}
-        self._tasks: List[PgDistTask] = []  # Requests to change pg_dist_group
-        self._in_flight: Optional[PgDistTask] = None  # Reference to the `PgDistTask` being processed
-        self._schedule_load_pg_dist_group = True  # Flag to query "pg_dist_group" from the database
-        self._condition = Condition()
-
-
-class CitusHandler(Citus, AbstractMPPHandler, Thread):
+class CitusDatabaseHandler(Citus, AbstractMPPHandler, Thread):
     """Define the interfaces for handling an underlying Citus cluster."""
 
     def __init__(self, postgresql: 'Postgresql', config: Dict[str, Union[str, int, list]]) -> None:
-        """"Initialize a new instance of :class:`CitusHandler`.
+        """"Initialize a new instance of :class:`CitusDatabaseHandler`.
 
         :param postgresql: the Postgres node.
         :param config: the ``citus`` MPP config section.
@@ -404,89 +394,66 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
         Thread.__init__(self)
         AbstractMPPHandler.__init__(self, postgresql, config)
         self.daemon = True
-        if isinstance(self._config['database'], str):
-            self.databases = [self._config['database']]
-        elif isinstance(self._config['database'], list):
-            self.databases = self._config['database']
         if config:
-            self._connections = {}
-            for database in self.databases:
-                citus = 'citus_' + str(database)
-                self._connections.setdefault(database, postgresql.connection_pool.get(
-                    citus, {'dbname': database,
-                            'options': '-c statement_timeout=0 -c idle_in_transaction_session_timeout=0'}))
-        self._cache_per_database: Dict[str, DatabaseCache] = {database: DatabaseCache() for database in self.databases}  # We are creating cache for each database
+            self._connection = postgresql.connection_pool.get(
+                'citus', {'dbname': config['database'],
+                          'options': '-c statement_timeout=0 -c idle_in_transaction_session_timeout=0'})
+        self._pg_dist_group: Dict[int, PgDistTask] = {}  # Cache of pg_dist_node: {groupid: PgDistTask()}
+        self._tasks: List[PgDistTask] = []  # Requests to change pg_dist_group, every task is a `PgDistTask`
+        self._in_flight: Optional[PgDistTask] = None  # Reference to the `PgDistTask` being changed in a transaction
+        self._schedule_load_pg_dist_group = True  # Flag that "pg_dist_group" should be queried from the database
+        self._condition = Condition()  # protects _pg_dist_group, _tasks, _in_flight, and _schedule_load_pg_dist_group
         self.schedule_cache_rebuild()
 
     def schedule_cache_rebuild(self) -> None:
         """Cache rebuild handler.
 
-        Is called to notify handler that it has to refresh its metadata cache from the databases.
-        """
-        for database in self.databases:
-            db_cache = self._cache_per_database[database]
-            with db_cache._condition:
-                db_cache._schedule_load_pg_dist_group = True
-
-    def schedule_cache_rebuild_multi(self, database: str) -> None:
-        """Cache rebuild handler.
-
         Is called to notify handler that it has to refresh its metadata cache from the database.
         """
-        db_cache = self._cache_per_database[database]
-        with db_cache._condition:
-            db_cache._schedule_load_pg_dist_group = True
+        with self._condition:
+            self._schedule_load_pg_dist_group = True
 
     def on_demote(self) -> None:
-        """Handle demotion by clearing database-specific attributes."""
+        with self._condition:
+            self._pg_dist_group.clear()
+            empty_tasks: List[PgDistTask] = []
+            self._tasks[:] = empty_tasks
+            self._in_flight = None
 
-        for database, db_cache in self._cache_per_database.items():
-            with db_cache._condition:
-                db_cache._pg_dist_group.clear()
-                db_cache._tasks[:] = []
-                db_cache._in_flight = None
-
-    def query(self, database: str, sql: str, *params: Any) -> List[Tuple[Any, ...]]:
+    def query(self, sql: str, *params: Any) -> List[Tuple[Any, ...]]:
         try:
             logger.debug('query(%s, %s)', sql, params)
-            return self._connections[database].query(sql, *params)
+            return self._connection.query(sql, *params)
         except Exception as e:
             logger.error('Exception when executing query "%s", (%s): %r', sql, params, e)
-            self._connections[database].close()
-
-            db_cache = self._cache_per_database[database]
-            with db_cache._condition:
-                db_cache._in_flight = None
-            
-            self.schedule_cache_rebuild_multi(database)
+            self._connection.close()
+            with self._condition:
+                self._in_flight = None
+            self.schedule_cache_rebuild()
             raise e
 
-    def load_pg_dist_group(self, database: str) -> bool:
+    def load_pg_dist_group(self) -> bool:
         """Read from the `pg_dist_node` table and put it into the local cache"""
 
-        db_cache = self._cache_per_database[database]
-
-        with db_cache._condition:
-            if not db_cache._schedule_load_pg_dist_group:
+        with self._condition:
+            if not self._schedule_load_pg_dist_group:
                 return True
-            db_cache._schedule_load_pg_dist_group = False
+            self._schedule_load_pg_dist_group = False
 
         try:
-            rows = self.query(database, 'SELECT groupid, nodename, nodeport,  \
-                            noderole, nodeid FROM pg_catalog.pg_dist_node')
+            rows = self.query('SELECT groupid, nodename, nodeport, noderole, nodeid FROM pg_catalog.pg_dist_node')
         except Exception:
             return False
 
-        _pg_dist_group: Dict[int, PgDistTask] = {}
+        pg_dist_group: Dict[int, PgDistTask] = {}
 
         for row in rows:
-            if row[0] not in _pg_dist_group:
-                _pg_dist_group[row[0]] = PgDistTask(row[0], nodes=set(), event='after_promote')
-            _pg_dist_group[row[0]].add(PgDistNode(*row[1:]))
+            if row[0] not in pg_dist_group:
+                pg_dist_group[row[0]] = PgDistTask(row[0], nodes=set(), event='after_promote')
+            pg_dist_group[row[0]].add(PgDistNode(*row[1:]))
 
-        with db_cache._condition:
-            db_cache._pg_dist_group = _pg_dist_group
-
+        with self._condition:
+            self._pg_dist_group = pg_dist_group
         return True
 
     def sync_meta_data(self, cluster: Cluster) -> None:
@@ -497,44 +464,27 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
         loop we make sure that works registered in `self._pg_dist_group`
         cache are matching the cluster view from DCS by creating tasks
         the same way as it is done from the REST API."""
-        try: 
-            self.add_new_databases()
-        except:
-            pass
 
-        if not self.is_coordinator():
-            return
+        with self._condition:
+            if not self.is_alive():
+                self.start()
 
+        self.add_task('after_promote', CITUS_COORDINATOR_GROUP_ID, cluster,
+                      self._postgresql.name, self._postgresql.connection_string)
 
-        for database in self._cache_per_database.keys():
+        for groupid, worker in cluster.workers.items():
+            leader = worker.leader
+            if leader and leader.conn_url\
+                    and leader.data.get('role') in (PostgresqlRole.MASTER, PostgresqlRole.PRIMARY)\
+                    and leader.data.get('state') == PostgresqlState.RUNNING:
+                self.add_task('after_promote', groupid, worker, leader.name, leader.conn_url)
 
-            db_cache = self._cache_per_database[database]
-            with db_cache._condition:
-                if not self.is_alive():
-                    self.start()
-
-            self.add_task(
-                database,
-                'after_promote',
-                CITUS_COORDINATOR_GROUP_ID,
-                cluster,
-                self._postgresql.name,
-                self._postgresql.connection_string,
-            )
-
-            for groupid, worker in cluster.workers.items():
-                leader = worker.leader
-                if leader and leader.conn_url\
-                        and leader.data.get('role') in (PostgresqlRole.MASTER, PostgresqlRole.PRIMARY) and leader.data.get('state') == PostgresqlState.RUNNING:
-                    self.add_task(database, 'after_promote', groupid, worker, leader.name, leader.conn_url)
-
-    def find_task_by_groupid(self, groupid: int, database: str) -> Optional[int]:
-        db_cache = self._cache_per_database[database]
-        for i, task in enumerate(db_cache._tasks):
+    def find_task_by_groupid(self, groupid: int) -> Optional[int]:
+        for i, task in enumerate(self._tasks):
             if task.groupid == groupid:
                 return i
 
-    def pick_task(self, database: str) -> Tuple[Optional[int], Optional[PgDistTask]]:
+    def pick_task(self) -> Tuple[Optional[int], Optional[PgDistTask]]:
         """Returns the tuple(i, task), where `i` - is the task index in the self._tasks list
 
         Tasks are picked by following priorities:
@@ -545,54 +495,52 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
            with groupid=0 (coordinators are always in groupid 0).
         3. Pick a task that is the oldest (first from the self._tasks)
         """
-        
-        db_cache = self._cache_per_database[database]
-        with db_cache._condition:
-            if db_cache._in_flight:
-                i = self.find_task_by_groupid(db_cache._in_flight.groupid, database)
+
+        with self._condition:
+            if self._in_flight:
+                i = self.find_task_by_groupid(self._in_flight.groupid)
             else:
                 while True:
-                    i = self.find_task_by_groupid(CITUS_COORDINATOR_GROUP_ID, database)  # set_coordinator
-                    if i is None and db_cache._tasks:
+                    i = self.find_task_by_groupid(CITUS_COORDINATOR_GROUP_ID)  # set_coordinator
+                    if i is None and self._tasks:
                         i = 0
                     if i is None:
                         break
-                    task = db_cache._tasks[i]
-                    if task == db_cache._pg_dist_group.get(task.groupid):
-                        db_cache._tasks.pop(i)
+                    task = self._tasks[i]
+                    if task == self._pg_dist_group.get(task.groupid):
+                        self._tasks.pop(i)  # nothing to do because cached version of pg_dist_group already matches
                     else:
                         break
-            task = db_cache._tasks[i] if i is not None else None
+            task = self._tasks[i] if i is not None else None
 
             return i, task
 
-    def update_node(self, database: str, groupid: int, node: PgDistNode, cooldown: float = 10000) -> None:
+    def update_node(self, groupid: int, node: PgDistNode, cooldown: float = 10000) -> None:
         if node.role not in ('primary', 'secondary', 'demoted'):
-            self.query(database, 'SELECT pg_catalog.citus_remove_node(%s, %s)', node.host, node.port)
+            self.query('SELECT pg_catalog.citus_remove_node(%s, %s)', node.host, node.port)
         elif node.nodeid is not None:
             host = node.host + ('-demoted' if node.role == 'demoted' else '')
-            self.query(database, 'SELECT pg_catalog.citus_update_node(%s, %s, %s, true, %s)',
+            self.query('SELECT pg_catalog.citus_update_node(%s, %s, %s, true, %s)',
                        node.nodeid, host, node.port, cooldown)
         elif node.role != 'demoted':
-            node.nodeid = self.query(database, "SELECT pg_catalog.citus_add_node(%s, %s, %s, %s, 'default')",
+            node.nodeid = self.query("SELECT pg_catalog.citus_add_node(%s, %s, %s, %s, 'default')",
                                      node.host, node.port, groupid, node.role)[0][0]
 
-    def update_group(self, database: str, task: PgDistTask, transaction: bool) -> None:
-        db_cache = self._cache_per_database[database]
-        current_state = db_cache._in_flight\
-            or db_cache._pg_dist_group.get(task.groupid)\
+    def update_group(self, task: PgDistTask, transaction: bool) -> None:
+        current_state = self._in_flight\
+            or self._pg_dist_group.get(task.groupid)\
             or PgDistTask(task.groupid, set(), 'after_promote')
         transitions = list(task.transition(current_state))
         if transitions:
             if not transaction and len(transitions) > 1:
-                self.query(database, 'BEGIN')
+                self.query('BEGIN')
             for node in transitions:
-                self.update_node(database, task.groupid, node, task.cooldown)
+                self.update_node(task.groupid, node, task.cooldown)
             if not transaction and len(transitions) > 1:
                 task.failover = False
-                self.query(database, 'COMMIT')
+                self.query('COMMIT')
 
-    def process_task(self, task: PgDistTask, database: str) -> bool:
+    def process_task(self, task: PgDistTask) -> bool:
         """Updates a single row in `pg_dist_group` table, optionally in a transaction.
 
         The transaction is started if we do a demote of the worker node or before promoting the other worker if
@@ -610,130 +558,100 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
             or, if the new transaction was opened, this method returns `False`.
         """
 
-        db_cache = self._cache_per_database[database]
         if task.event == 'after_promote':
-            self.update_group(database, task, db_cache._in_flight is not None)
-            if db_cache._in_flight:
-                self.query(database, 'COMMIT')
+            self.update_group(task, self._in_flight is not None)
+            if self._in_flight:
+                self.query('COMMIT')
             task.failover = False
             return True
         else:  # before_demote, before_promote
             if task.timeout:
                 task.deadline = time.time() + task.timeout
-            if not db_cache._in_flight:
-                self.query(database, 'BEGIN')
-            self.update_group(database, task, True)
+            if not self._in_flight:
+                self.query('BEGIN')
+            self.update_group(task, True)
         return False
 
-    def process_tasks(self, database: str) -> None:
-        db_cache = self._cache_per_database[database]
+    def process_tasks(self) -> None:
         while True:
             # Read access to `_in_flight` isn't protected because we know it can't be changed outside of our thread.
-            if not db_cache._in_flight and not self.load_pg_dist_group(database):
+            if not self._in_flight and not self.load_pg_dist_group():
                 break
 
-            i, task = self.pick_task(database)
+            i, task = self.pick_task()
             if not task or i is None:
                 break
             try:
-                update_cache = self.process_task(task, database)
+                update_cache = self.process_task(task)
             except Exception as e:
                 logger.error('Exception when working with pg_dist_node: %r', e)
                 update_cache = None
-            with db_cache._condition:
-                if db_cache._tasks:
+            with self._condition:
+                if self._tasks:
                     if update_cache:
-                        db_cache._pg_dist_group[task.groupid] = task
+                        self._pg_dist_group[task.groupid] = task
 
                     if update_cache is False:  # an indicator that process_tasks has started a transaction
-                        db_cache._in_flight = task
+                        self._in_flight = task
                     else:
-                        db_cache._in_flight = None
-                    if id(db_cache._tasks[i]) == id(task):
-                        db_cache._tasks.pop(i)
+                        self._in_flight = None
+
+                    if id(self._tasks[i]) == id(task):
+                        self._tasks.pop(i)
             task.wakeup()
 
     def run(self) -> None:
-        with ThreadPoolExecutor(max_workers=1000) as executor:
-            while True:
-                try:
-                    futures = []
-                    for database in self._cache_per_database.keys():
-                        db_cache = self._cache_per_database[database]
-                        with db_cache._condition:
-                            if db_cache._schedule_load_pg_dist_group:
-                                timeout = -1
-                            elif db_cache._in_flight:
-                                timeout = db_cache._in_flight.deadline - time.time() if db_cache._tasks else None
-                            else:
-                                timeout = -1 if db_cache._tasks else None
+        while True:
+            try:
+                with self._condition:
+                    if self._schedule_load_pg_dist_group:
+                        timeout = -1
+                    elif self._in_flight:
+                        timeout = self._in_flight.deadline - time.time() if self._tasks else None
+                    else:
+                        timeout = -1 if self._tasks else None
 
-                            if timeout is None or timeout > 0:
-                                db_cache._condition.wait(timeout)
-                            elif db_cache._in_flight:
-                                logger.warning(
-                                    'Rolling back transaction for database "%s". Last known status: %s',
-                                    database,
-                                    db_cache._in_flight
-                                )
-                                self.query(database, 'ROLLBACK')
-                                db_cache._in_flight = None
-                            #self.process_tasks(database)
-                            futures.append(executor.submit(self.process_tasks, database))
-                    for future in futures:
-                        future.result()
-                except Exception:
-                    logger.exception('run')
+                    if timeout is None or timeout > 0:
+                        self._condition.wait(timeout)
+                    elif self._in_flight:
+                        logger.warning('Rolling back transaction. Last known status: %s', self._in_flight)
+                        self.query('ROLLBACK')
+                        self._in_flight = None
+                self.process_tasks()
+            except Exception:
+                logger.exception('run')
 
-    def _add_task(self, database: str, task: PgDistTask) -> bool:
-        db_cache = self._cache_per_database[database]
-        with db_cache._condition:
-            i = self.find_task_by_groupid(task.groupid, database)
+    def _add_task(self, task: PgDistTask) -> bool:
+        with self._condition:
+            i = self.find_task_by_groupid(task.groupid)
 
             # The `PgDistNode.timeout` == None is an indicator that it was scheduled from the sync_meta_data().
             if task.timeout is None:
                 # We don't want to override the already existing task created from REST API.
-                if (
-                    i is not None
-                    and db_cache._tasks[i].timeout is not None
-                ):
+                if i is not None and self._tasks[i].timeout is not None:
                     return False
 
                 # There is a little race condition with tasks created from REST API - the call made "before" the member
                 # key is updated in DCS. Therefore it is possible that :func:`sync_meta_data` will try to create a task
                 # based on the outdated values of "state"/"role". To solve it we introduce an artificial timeout.
                 # Only when the timeout is reached new tasks could be scheduled from sync_meta_data()
-                if (
-                    db_cache._in_flight
-                    and db_cache._in_flight.groupid == task.groupid
-                    and db_cache._in_flight.timeout is not None
-                    and db_cache._in_flight.deadline > time.time()
-                ):
+                if self._in_flight and self._in_flight.groupid == task.groupid and self._in_flight.timeout is not None\
+                        and self._in_flight.deadline > time.time():
                     return False
 
             # Override already existing task for the same worker groupid
             if i is not None:
-                if task != db_cache._tasks[i]:
-                    logger.debug(
-                        "Overriding existing task: %s != %s",
-                        db_cache._tasks[i],
-                        task,
-                    )
-                    db_cache._tasks[i] = task
-                    db_cache._condition.notify()
+                if task != self._tasks[i]:
+                    logger.debug('Overriding existing task: %s != %s', self._tasks[i], task)
+                    self._tasks[i] = task
+                    self._condition.notify()
                     return True
             # Add the task to the list if Worker node state is different from the cached `pg_dist_group`
-            elif (
-                db_cache._schedule_load_pg_dist_group
-                or task != db_cache._pg_dist_group.get(task.groupid)
-                or (
-                    db_cache._in_flight
-                    and task.groupid == db_cache._in_flight.groupid
-                )
-            ):
+            elif self._schedule_load_pg_dist_group or task != self._pg_dist_group.get(task.groupid)\
+                    or self._in_flight and task.groupid == self._in_flight.groupid:
                 logger.debug('Adding the new task: %s', task)
-                db_cache._tasks.append(task)
-                db_cache._condition.notify()
+                self._tasks.append(task)
+                self._condition.notify()
                 return True
         return False
 
@@ -746,7 +664,7 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
         except Exception as e:
             logger.error('Failed to parse connection url %s: %r', conn_url, e)
 
-    def add_task(self, database: str, event: str, groupid: int, cluster: Cluster, leader_name: str, leader_url: str,
+    def add_task(self, event: str, groupid: int, cluster: Cluster, leader_name: str, leader_url: str,
                  timeout: Optional[float] = None, cooldown: Optional[float] = None) -> Optional[PgDistTask]:
         primary = self._pg_dist_node('demoted' if event == 'before_demote' else 'primary', leader_url)
         if not primary:
@@ -759,133 +677,184 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
                 else None
             if secondary:
                 task.add(secondary)
-        return task if self._add_task(database, task) else None
+        return task if self._add_task(task) else None
 
-    def handle_event(self, cluster: Cluster, event: Dict[str, Any]) -> None:
+    def handle_event(self, cluster: Cluster, event: Dict[str, Any]) -> Optional[PgDistTask]:
         if not self.is_alive():
             return
 
         worker = cluster.workers.get(event['group'])
-        if not (
-            worker
-            and worker.leader
-            and worker.leader.name == event['leader']
-            and worker.leader.conn_url
-        ):
+        if not (worker and worker.leader and worker.leader.name == event['leader'] and worker.leader.conn_url):
             return logger.info('Discarding event %s', event)
 
-        for database in self._cache_per_database.keys():
-            task = self.add_task(
-                database,
-                event['type'],
-                event['group'],
-                worker,
-                worker.leader.name,
-                worker.leader.conn_url,
-                event['timeout'],
-                event['cooldown'] * 1000,
-            )
-
-            if task and event['type'] == 'before_demote':
-                task.wait()
-
-    def add_new_databases(self) -> None:
-        """Creates a newly added database(s) and citus extension if not exists."""
-
-        for database in self.databases:
-
-            conn_kwargs = {
-                **self._postgresql.connection_pool.conn_kwargs,
-                "options": "-c synchronous_commit=local -c statement_timeout=0",
-            }
-
-            if database != self._postgresql.database:
-                conn = connect(**conn_kwargs)
-                try:
-                    with conn.cursor() as cur:
-                        cur.execute("SHOW transaction_read_only;")
-                        is_read_only = cur.fetchone()[0] == 'on'
-
-                    if is_read_only:
-                        logger.info("PG instance is secondary and in read-only mode.")
-                        conn.close()
-                        break
-                except ProgrammingError as exc:
-                    raise exc
-
-                try:
-                    with conn.cursor() as cur:
-                        cur.execute("SELECT 1 FROM pg_database where datname = %s", (database,))
-                        if cur.fetchone():
-                            logger.info("Database already exists. Continue to next database in config...")
-                            conn.close()
-                            continue
-                except ProgrammingError as exc:
-                    raise exc
-
-                try:
-                    with conn.cursor() as cur:
-                        cur.execute('CREATE DATABASE {0}'.format(quote_ident(database, conn)).encode('utf-8'))
-                except ProgrammingError as exc:
-                    if exc.diag.sqlstate == '42P04':  # DuplicateDatabase
-                        logger.debug('Exception when creating database: %r', exc)
-                    else:
-                        raise exc
-                finally:
-                    conn.close()
-
-            conn_kwargs['dbname'] = database
-            conn = connect(**conn_kwargs)
-            try:
-                with conn.cursor() as cur:
-                    cur.execute('CREATE EXTENSION IF NOT EXISTS citus')
-            finally:
-                conn.close()
+        task = self.add_task(event['type'], event['group'], worker,
+                             worker.leader.name, worker.leader.conn_url,
+                             event['timeout'], event['cooldown'] * 1000)
+        if task and event['type'] == 'before_demote':
+            return task
 
     def bootstrap(self) -> None:
         """Bootstrap handler.
 
         Is called when the new cluster is initialized (through ``initdb`` or a custom bootstrap method).
-
         """
-        for database in self.databases:
-            conn_kwargs = {
-                **self._postgresql.connection_pool.conn_kwargs,
-                "options": "-c synchronous_commit=local -c statement_timeout=0",
-            }
-            if database != self._postgresql.database:
-                conn = connect(**conn_kwargs)
-                try:
-                    with conn.cursor() as cur:
-                        cur.execute('CREATE DATABASE {0}'.format(
-                            quote_ident(database, conn)).encode('utf-8'))
-                except ProgrammingError as exc:
-                    if exc.diag.sqlstate == '42P04':  # DuplicateDatabase
-                        logger.debug('Exception when creating database: %r', exc)
-                    else:
-                        raise exc
-                finally:
-                    conn.close()
-
-            conn_kwargs['dbname'] = database
+        conn_kwargs = {**self._postgresql.connection_pool.conn_kwargs,
+                       'options': '-c synchronous_commit=local -c statement_timeout=0'}
+        if self._config['database'] != self._postgresql.database:
             conn = connect(**conn_kwargs)
             try:
                 with conn.cursor() as cur:
-                    cur.execute('CREATE EXTENSION IF NOT EXISTS citus')
-
-                    superuser = self._postgresql.config.superuser
-                    params = {k: superuser[k] for k in ('password', 'sslcert', 'sslkey') if k in superuser}
-                    if params:
-                        cur.execute("INSERT INTO pg_catalog.pg_dist_authinfo VALUES"
-                                    "(0, pg_catalog.current_user(), %s)",
-                                    (self._postgresql.config.format_dsn(params),))
-
-                    if self.is_coordinator():
-                        r = urlparse(self._postgresql.connection_string)
-                        cur.execute("SELECT pg_catalog.citus_set_coordinator_host(%s, %s, 'primary', 'default')",
-                                    (r.hostname, r.port or 5432))
+                    cur.execute('CREATE DATABASE {0}'.format(
+                        quote_ident(self._config['database'], conn)).encode('utf-8'))
+            except ProgrammingError as exc:
+                if exc.diag.sqlstate == '42P04':  # DuplicateDatabase
+                    logger.debug('Exception when creating database: %r', exc)
+                else:
+                    raise exc
             finally:
                 conn.close()
+
+        conn_kwargs['dbname'] = self._config['database']
+        conn = connect(**conn_kwargs)
+        try:
+            with conn.cursor() as cur:
+                cur.execute('CREATE EXTENSION IF NOT EXISTS citus')
+
+                superuser = self._postgresql.config.superuser
+                params = {k: superuser[k] for k in ('password', 'sslcert', 'sslkey') if k in superuser}
+                if params:
+                    cur.execute("INSERT INTO pg_catalog.pg_dist_authinfo VALUES"
+                                "(0, pg_catalog.current_user(), %s)",
+                                (self._postgresql.config.format_dsn(params),))
+
+                if self.is_coordinator():
+                    r = urlparse(self._postgresql.connection_string)
+                    cur.execute("SELECT pg_catalog.citus_set_coordinator_host(%s, %s, 'primary', 'default')",
+                                (r.hostname, r.port or 5432))
+        finally:
+            conn.close()
+
+    def adjust_postgres_gucs(self, parameters: Dict[str, Any]) -> None:
+        pass
+
+    def ignore_replication_slot(self, slot: Dict[str, str]) -> bool:
+        """Check whether provided replication *slot* existing in the database should not be removed.
+
+        .. note::
+            MPP database may create replication slots for its own use, for example to migrate data between workers
+            using logical replication, and we don't want to suddenly drop them.
+
+        :param slot: dictionary containing the replication slot settings, like ``name``, ``database``, ``type``, and
+                     ``plugin``.
+
+        :returns: ``True`` if the replication slots should not be removed, otherwise ``False``.
+        """
+        if self._postgresql.is_primary() and slot['type'] == 'logical' and slot['database'] == self._config['database']:
+            m = CITUS_SLOT_NAME_RE.match(slot['name'])
+            return bool(m and {'move': 'pgoutput', 'split': 'citus'}.get(m.group(1)) == slot['plugin'])
+        return False
+
+
+class CitusHandler(Citus, AbstractMPPHandler):
+    """Define the interfaces for handling an underlying Citus cluster."""
+
+    def __init__(self, postgresql: 'Postgresql', config: Dict[str, Union[str, int, list]]) -> None:
+        """"Initialize a new instance of :class:`CitusHandler`.
+
+        :param postgresql: the Postgres node.
+        :param config: the ``citus`` MPP config section.
+        """
+        AbstractMPPHandler.__init__(self, postgresql, config)
+        self._citus_database_handlers = {}
+
+        dbconfig = config.copy()
+
+        if isinstance(config['database'], str):
+            config['database'] = [config['database']]
+
+        self.databases = config['database']
+
+        for dbname in config['database']:
+            dbconfig['database'] = dbname
+            self._citus_database_handlers[dbname] = CitusDatabaseHandler(postgresql, dbconfig)
+
+    def schedule_cache_rebuild(self) -> None:
+        for handler in self._citus_database_handlers.values():
+            handler.schedule_cache_rebuild()
+
+    def on_demote(self) -> None:
+        for handler in self._citus_database_handlers.values():
+            handler.on_demote()
+
+    def add_new_databases(self, database: str) -> None:
+        """Creates a newly added database(s) and citus extension if not exists."""
+
+        base_conn_kwargs = {
+            **self._postgresql.connection_pool.conn_kwargs,
+            "options": "-c synchronous_commit=local -c statement_timeout=0",
+        }
+
+        # Skip if the database is the same as the main PostgreSQL DB
+        if database == self._postgresql.database:
+            return
+
+        # First connection to check if instance is read-only and if DB exists
+        with connect(**base_conn_kwargs) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SHOW transaction_read_only;")
+                if cur.fetchone()[0] == 'on':
+                    logger.info("PG instance is secondary and in read-only mode.")
+                    return
+
+                cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (database,))
+                if cur.fetchone():
+                    logger.info("Database '%s' already exists. Skipping creation.", database)
+                    return
+
+            # Try to create the new database
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(f'CREATE DATABASE {quote_ident(database, conn)}')
+            except ProgrammingError as exc:
+                if exc.diag.sqlstate == '42P04':  # DuplicateDatabase
+                    logger.debug('Database already exists: %r', exc)
+                else:
+                    raise
+
+        # After DB creation, connect to it and ensure citus extension exists
+        db_conn_kwargs = {**base_conn_kwargs, "dbname": database}
+        with connect(**db_conn_kwargs) as conn:
+            with conn.cursor() as cur:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS citus")
+
+    def sync_meta_data(self, cluster: Cluster) -> None:
+        
+        for database in self.databases:
+            try:
+                self.add_new_databases(database)
+            except Exception as e:
+                logger.warning("Failed to sync metadata for database %s: %s", database, e)
+
+        
+        if not self.is_coordinator():
+            return
+
+        for handler in self._citus_database_handlers.values():
+            handler.sync_meta_data(cluster)
+
+    def handle_event(self, cluster: Cluster, event: Dict[str, Any]) -> None:
+        tasks = []
+        for handler in self._citus_database_handlers.values():
+            task = handler.handle_event(cluster, event)
+            if task:
+                tasks.append(task)
+
+        for task in tasks:
+            task.wait()
+
+    def bootstrap(self) -> None:
+        for handler in self._citus_database_handlers.values():
+            handler.bootstrap()
 
     def adjust_postgres_gucs(self, parameters: Dict[str, Any]) -> None:
         """Adjust GUCs in the current PostgreSQL configuration.
@@ -910,18 +879,11 @@ class CitusHandler(Citus, AbstractMPPHandler, Thread):
         parameters['citus.local_hostname'] = self._postgresql.connection_pool.conn_kwargs.get('host', 'localhost')
 
     def ignore_replication_slot(self, slot: Dict[str, str]) -> bool:
-        """Check whether provided replication *slot* existing in the database should not be removed.
+        return any(handler.ignore_replication_slot(slot) for handler in self._citus_database_handlers.values())
 
-        .. note::
-            MPP database may create replication slots for its own use, for example to migrate data between workers
-            using logical replication, and we don't want to suddenly drop them.
+    def get_citus_database_handlers(self) -> None:
+        return self._citus_database_handlers
 
-        :param slot: dictionary containing the replication slot settings, like ``name``, ``database``, ``type``, and
-                     ``plugin``.
-
-        :returns: ``True`` if the replication slots should not be removed, otherwise ``False``.
-        """
-        if self._postgresql.is_primary() and slot['type'] == 'logical' and slot['database'] in self.databases:
-            m = CITUS_SLOT_NAME_RE.match(slot['name'])
-            return bool(m and {'move': 'pgoutput', 'split': 'citus'}.get(m.group(1)) == slot['plugin'])
-        return False
+    def start(self)-> None:
+        for handler in self._citus_database_handlers.values():
+            handler.start 

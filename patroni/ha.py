@@ -2227,7 +2227,6 @@ class Ha(object):
                     self.state_handler.set_state(PostgresqlState.CRASHED)
                 # try to start dead postgres
                 return self.recover()
-
             if self.cluster.is_unlocked():
                 ret = self.process_unhealthy_cluster()
             else:
