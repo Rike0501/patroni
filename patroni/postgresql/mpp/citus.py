@@ -786,7 +786,7 @@ class CitusHandler(Citus, AbstractMPPHandler):
         for handler in self._citus_database_handlers.values():
             handler.on_demote()
 
-    def add_new_databases(self, database: str) -> None:
+    def add_new_databases(self, database: str) -> Optional[bool]:
         """Creates a newly added database(s) and citus extension if not exists."""
 
         base_conn_kwargs = {
@@ -796,7 +796,7 @@ class CitusHandler(Citus, AbstractMPPHandler):
 
         # Skip if the database is the same as the main PostgreSQL DB
         if database == self._postgresql.database:
-            return
+            return 
 
         # First connection to check if instance is read-only and if DB exists
         with connect(**base_conn_kwargs) as conn:
@@ -804,12 +804,12 @@ class CitusHandler(Citus, AbstractMPPHandler):
                 cur.execute("SHOW transaction_read_only;")
                 if cur.fetchone()[0] == 'on':
                     logger.info("PG instance is secondary and in read-only mode.")
-                    return
+                    return True
 
                 cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (database,))
                 if cur.fetchone():
                     logger.info("Database '%s' already exists. Skipping creation.", database)
-                    return
+                    return True
 
             # Try to create the new database
             try:
@@ -831,7 +831,8 @@ class CitusHandler(Citus, AbstractMPPHandler):
         
         for database in self.databases:
             try:
-                self.add_new_databases(database)
+                if self.add_new_databases(database):
+                    break
             except Exception as e:
                 logger.warning("Failed to sync metadata for database %s: %s", database, e)
 
